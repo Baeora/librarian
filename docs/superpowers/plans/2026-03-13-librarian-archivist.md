@@ -1697,26 +1697,42 @@ In `_role_providers` dict (around line 111) to include:
     "archivist": self.settings.archivist_provider,
 ```
 
-Add prefix-based fallback methods `resolve_model` and `resolve_provider`:
-```python
-    def resolve_model(self, role: str) -> str:
-        """Resolve model for a role, with prefix fallback for librarian_*."""
-        if role in self._role_models:
-            return self._role_models[role]
-        if role.startswith("librarian_"):
-            return self._role_models.get("librarian", self.settings.model_librarian)
-        return self._role_models.get(role, self.settings.model_competitor)
+Update `route()`, `_role_models`, and `_role_providers` to use prefix-based fallback. The prefix fallback is applied **inside the existing `route()` method** and its internal lookups, not as separate methods. This ensures the pipeline's existing call to `route()` works for dynamic `librarian_*` roles:
 
-    def resolve_provider(self, role: str) -> str:
-        """Resolve provider override for a role, with prefix fallback."""
-        if role in self._role_providers:
-            return self._role_providers[role]
+In `_role_models` and `_role_providers` dict lookups (used by `_config_for_default`, `_config_for_explicit`, and `route()`), wrap with a helper:
+
+```python
+    def _resolve_role_key(self, role: str, table: dict[str, str]) -> str:
+        """Lookup with prefix fallback for librarian_* roles."""
+        if role in table:
+            return table[role]
         if role.startswith("librarian_"):
-            return self._role_providers.get("librarian", "")
-        return self._role_providers.get(role, "")
+            return table.get("librarian", "")
+        return table.get(role, "")
 ```
 
-Update `route()` method to use prefix fallback for routing table lookups.
+Update all `self._role_models.get(role)` calls to use `self._resolve_role_key(role, self._role_models)` and all `self._role_providers.get(role, "")` calls to use `self._resolve_role_key(role, self._role_providers)`.
+
+Similarly, for the routing table lookup in `_auto_route`, add prefix fallback:
+
+```python
+    def _resolve_routing_table(self, role: str) -> list[ProviderClass]:
+        if role in self._table:
+            return self._table[role]
+        if role.startswith("librarian_"):
+            return self._table.get("librarian", [ProviderClass.MID_TIER])
+        return [ProviderClass.MID_TIER]
+```
+
+Also add convenience methods for the pipeline adapter and tests:
+
+```python
+    def resolve_model(self, role: str) -> str:
+        return self._resolve_role_key(role, self._role_models) or self.settings.model_competitor
+
+    def resolve_provider(self, role: str) -> str:
+        return self._resolve_role_key(role, self._role_providers)
+```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -2406,7 +2422,23 @@ def add_book(
         raise typer.Exit(1)
 
     console.print(f"[green]Registered:[/green] {book_name} ({meta['chapter_count']} chapters, ~{meta['token_count']} tokens)")
-    console.print("[yellow]Note:[/yellow] reference.md requires an LLM ingestion call. Run with a configured provider to generate it.")
+
+    # Attempt LLM ingestion if a provider is configured
+    try:
+        from autocontext.providers import create_provider, get_provider
+        provider = get_provider(settings)
+        from autocontext.knowledge.ingestion import ingest_book
+        console.print("[dim]Generating reference.md via LLM ingestion...[/dim]")
+        ingest_book(
+            library_root=library_root,
+            book_name=book_name,
+            provider=provider,
+            model=settings.ingestion_model,
+        )
+        console.print("[green]reference.md generated successfully.[/green]")
+    except Exception as e:
+        console.print(f"[yellow]Skipping LLM ingestion:[/yellow] {e}")
+        console.print("[yellow]Set AUTOCONTEXT_AGENT_PROVIDER and API key, then re-run add-book.[/yellow]")
 
 
 @app.command("list-books")
