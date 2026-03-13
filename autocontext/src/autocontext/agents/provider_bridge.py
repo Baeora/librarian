@@ -19,6 +19,7 @@ from autocontext.harness.core.types import ModelResponse, RoleUsage
 if TYPE_CHECKING:
     from autocontext.config.settings import AppSettings
     from autocontext.providers.base import LLMProvider
+    from autocontext.runtimes.base import AgentRuntime
 
 
 class ProviderBridgeClient(LanguageModelClient):
@@ -64,14 +65,53 @@ class ProviderBridgeClient(LanguageModelClient):
         )
 
 
+class RuntimeBridgeClient(LanguageModelClient):
+    """Adapts an AgentRuntime to the LanguageModelClient interface.
+
+    This bridge enables any AgentRuntime (PiCLI, ClaudeCLI, etc.)
+    to be used as a client for agent role runners.
+    """
+
+    def __init__(self, runtime: AgentRuntime) -> None:
+        self._runtime = runtime
+
+    def generate(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        role: str = "",
+    ) -> ModelResponse:
+        del max_tokens, temperature, role
+        t0 = time.monotonic()
+        output = self._runtime.generate(prompt)
+        error = output.metadata.get("error")
+        if error:
+            detail = output.metadata.get("detail") or output.metadata.get("stderr") or ""
+            raise RuntimeError(f"{self._runtime.name} failed: {error}{f' ({detail})' if detail else ''}")
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        return ModelResponse(
+            text=output.text,
+            usage=RoleUsage(
+                input_tokens=max(1, len(prompt) // 4),
+                output_tokens=max(1, len(output.text) // 4),
+                latency_ms=elapsed_ms,
+                model=output.model or model,
+            ),
+            metadata=dict(output.metadata),
+        )
+
+
 def _provider_api_key(provider_type: str, settings: AppSettings) -> str | None:
     if provider_type == "anthropic":
         return settings.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
     if provider_type in ("openai", "openai-compatible"):
-        return settings.judge_api_key or os.getenv("OPENAI_API_KEY")
+        return settings.agent_api_key or settings.judge_api_key or os.getenv("OPENAI_API_KEY")
     if provider_type == "vllm":
-        return settings.judge_api_key or "no-key"
-    return settings.judge_api_key
+        return settings.agent_api_key or settings.judge_api_key or "no-key"
+    return settings.agent_api_key or settings.judge_api_key
 
 
 def _create_provider_bridge(
@@ -97,7 +137,8 @@ def _create_provider_bridge(
         provider = create_provider(
             provider_type=provider_type,
             api_key=_provider_api_key(provider_type, settings),
-            base_url=settings.judge_base_url,
+            base_url=settings.agent_base_url or settings.judge_base_url,
+            model=model_override or settings.agent_default_model,
         )
         use_provider_default_model = True
     return ProviderBridgeClient(provider, use_provider_default_model=use_provider_default_model)
@@ -173,6 +214,27 @@ def create_role_client(
             timeout_seconds=float(getattr(settings, "openclaw_timeout_seconds", 30.0)),
             retry_base_delay=float(getattr(settings, "openclaw_retry_base_delay", 0.25)),
         )
+
+    if provider_type == "pi":
+        from autocontext.runtimes.pi_cli import PiCLIConfig, PiCLIRuntime
+
+        config = PiCLIConfig(
+            pi_command=settings.pi_command,
+            timeout=settings.pi_timeout,
+            workspace=settings.pi_workspace,
+            model=settings.pi_model,
+        )
+        return RuntimeBridgeClient(PiCLIRuntime(config))
+
+    if provider_type == "pi-rpc":
+        from autocontext.runtimes.pi_rpc import PiRPCConfig, PiRPCRuntime
+
+        rpc_config = PiRPCConfig(
+            endpoint=settings.pi_rpc_endpoint or "http://localhost:3284",
+            api_key=settings.pi_rpc_api_key,
+            session_persistence=settings.pi_rpc_session_persistence,
+        )
+        return RuntimeBridgeClient(PiRPCRuntime(rpc_config))
 
     # LLMProvider-based providers — use the bridge
     if provider_type in ("mlx", "openai", "openai-compatible", "ollama", "vllm"):
