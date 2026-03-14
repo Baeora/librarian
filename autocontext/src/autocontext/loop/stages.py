@@ -267,6 +267,8 @@ def stage_knowledge_setup(
     tool_context = "" if ablation else artifacts.read_tool_context(ctx.scenario_name)
     skills_context = "" if ablation else artifacts.read_skills(ctx.scenario_name)
     recent_analysis = "" if ablation else artifacts.read_latest_advance_analysis(ctx.scenario_name, ctx.generation)
+    weakness_reports = "" if ablation else artifacts.read_latest_weakness_reports_markdown(ctx.scenario_name)
+    progress_reports = "" if ablation else artifacts.read_latest_progress_reports_markdown(ctx.scenario_name)
     score_trajectory = "" if ablation else trajectory_builder.build_trajectory(ctx.run_id)
     strategy_registry = "" if ablation else trajectory_builder.build_strategy_registry(ctx.run_id)
 
@@ -304,6 +306,27 @@ def stage_knowledge_setup(
                 _apply_tuning_to_settings(ctx, validated)
 
     experiment_log = "" if ablation else trajectory_builder.build_experiment_log(ctx.run_id)
+    mutation_replay = "" if ablation else artifacts.read_mutation_replay(ctx.scenario_name)
+    if not isinstance(mutation_replay, str):
+        mutation_replay = ""
+    if mutation_replay:
+        experiment_log = (
+            f"{experiment_log}\n\n{mutation_replay}".strip()
+            if experiment_log
+            else mutation_replay
+        )
+    if weakness_reports:
+        experiment_log = (
+            f"{experiment_log}\n\nRecent weakness reports:\n{weakness_reports}".strip()
+            if experiment_log
+            else f"Recent weakness reports:\n{weakness_reports}"
+        )
+    if progress_reports:
+        experiment_log = (
+            f"{experiment_log}\n\nRecent progress reports:\n{progress_reports}".strip()
+            if experiment_log
+            else f"Recent progress reports:\n{progress_reports}"
+        )
 
     summary_text = f"best score so far: {ctx.previous_best:.4f}"
     strategy_interface = scenario.describe_strategy_interface()

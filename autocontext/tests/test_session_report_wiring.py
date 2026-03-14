@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from autocontext.config.settings import AppSettings
 
 
@@ -54,6 +56,8 @@ def _make_runner_with_mocks(settings: AppSettings) -> tuple[Any, dict[str, Any]]
 
     # Default: no existing generations (not skipped for idempotency)
     runner.sqlite.generation_exists.return_value = False
+    runner.sqlite.get_agent_role_metrics.return_value = []
+    runner.sqlite.get_total_consultation_cost.return_value = 0.0
 
     # Default: scenario lookup succeeds
     scenario_mock = MagicMock()
@@ -187,6 +191,81 @@ class TestSessionReportPersistence:
         assert len(call_args[0][2]) > 0
 
 
+class TestWeaknessReportWiring:
+    """Weakness reports are generated from the live run completion path."""
+
+    def test_weakness_report_generated_on_run_completion(self, tmp_path: Path) -> None:
+        settings = _make_settings(tmp_path, session_reports_enabled=False)
+        runner, mocks = _make_runner_with_mocks(settings)
+
+        trajectory_rows = [
+            {"generation_index": 1, "best_score": 0.3, "elo": 1000, "delta": 0.0, "gate_decision": "advance"},
+            {"generation_index": 2, "best_score": 0.1, "elo": 980, "delta": -0.2, "gate_decision": "rollback"},
+            {"generation_index": 3, "best_score": 0.2, "elo": 990, "delta": 0.1, "gate_decision": "advance"},
+            {"generation_index": 4, "best_score": 0.05, "elo": 960, "delta": -0.15, "gate_decision": "rollback"},
+            {"generation_index": 5, "best_score": 0.04, "elo": 950, "delta": -0.01, "gate_decision": "rollback"},
+        ]
+        match_rows = [
+            {"generation_index": 2, "score": 0.1, "passed_validation": False, "validation_errors": '["bad action"]'},
+            {"generation_index": 4, "score": 0.05, "passed_validation": False, "validation_errors": '["bad action"]'},
+        ]
+        mocks["sqlite"].get_generation_trajectory.return_value = trajectory_rows
+        mocks["sqlite"].get_matches_for_run.return_value = match_rows
+        mocks["artifacts"].tools_dir.return_value = MagicMock(exists=MagicMock(return_value=True))
+
+        _run_with_pipeline_mock(runner, mocks, "grid_ctf", 5, "test_weakness")
+
+        mocks["artifacts"].write_weakness_report.assert_called_once()
+        call_args = mocks["artifacts"].write_weakness_report.call_args
+        assert call_args[0][0] == "grid_ctf"
+        assert call_args[0][1] == "test_weakness"
+        report = call_args[0][2]
+        assert report.run_id == "test_weakness"
+        assert report.scenario == "grid_ctf"
+        assert report.total_generations == 5
+        assert report.weaknesses
+
+
+class TestProgressReportWiring:
+    """Normalized progress reports are generated from the live run completion path."""
+
+    def test_progress_report_generated_on_run_completion(self, tmp_path: Path) -> None:
+        settings = _make_settings(tmp_path, session_reports_enabled=False)
+        runner, mocks = _make_runner_with_mocks(settings)
+
+        trajectory_rows = [
+            {"generation_index": 1, "best_score": 0.3, "elo": 1000, "delta": 0.3, "gate_decision": "advance"},
+            {"generation_index": 2, "best_score": 0.5, "elo": 1050, "delta": 0.2, "gate_decision": "advance"},
+        ]
+        role_metrics = [
+            {
+                "generation_index": 1,
+                "role": "competitor",
+                "model": "claude-sonnet-4-5-20250929",
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "latency_ms": 100,
+                "subagent_id": "competitor",
+                "status": "success",
+            }
+        ]
+        mocks["sqlite"].get_generation_trajectory.return_value = trajectory_rows
+        mocks["sqlite"].get_agent_role_metrics.return_value = role_metrics
+        mocks["sqlite"].get_total_consultation_cost.return_value = 0.01
+        mocks["artifacts"].tools_dir.return_value = MagicMock(exists=MagicMock(return_value=True))
+
+        _run_with_pipeline_mock(runner, mocks, "grid_ctf", 2, "test_progress")
+
+        mocks["artifacts"].write_progress_report.assert_called_once()
+        call_args = mocks["artifacts"].write_progress_report.call_args
+        assert call_args[0][0] == "grid_ctf"
+        assert call_args[0][1] == "test_progress"
+        report = call_args[0][2]
+        assert report.run_id == "test_progress"
+        assert report.cost.total_tokens == 1500
+        assert report.cost.total_cost_usd > 0
+
+
 class TestSessionReportEmptyTrajectory:
     """Handles empty trajectory (0 completed generations) gracefully."""
 
@@ -225,6 +304,77 @@ class TestSessionReportDuration:
         markdown = mocks["artifacts"].write_session_report.call_args[0][2]
         # Duration should appear in the report -- it will be very small (< 1s) in test
         assert "Duration:" in markdown
+
+
+class TestMutationLogWiring:
+    """Mutation log is appended and checkpointed from the live runner path."""
+
+    def test_run_appends_outcome_and_creates_checkpoint(self, tmp_path: Path) -> None:
+        settings = _make_settings(tmp_path, session_reports_enabled=False)
+        runner, mocks = _make_runner_with_mocks(settings)
+        mocks["artifacts"].mutation_log = MagicMock()
+        mocks["artifacts"].tools_dir.return_value = MagicMock(exists=MagicMock(return_value=True))
+
+        with patch("autocontext.loop.generation_pipeline.GenerationPipeline") as mock_pipeline_cls:
+            mock_pipeline = MagicMock()
+            mock_pipeline_cls.return_value = mock_pipeline
+
+            def fake_run_gen(ctx: Any) -> Any:
+                ctx.gate_decision = "advance"
+                ctx.previous_best = 0.42
+                ctx.challenger_elo = 1042.0
+                return ctx
+
+            mock_pipeline.run_generation.side_effect = fake_run_gen
+
+            with patch.object(runner, "_scenario") as mock_scenario:
+                mock_scenario.return_value = mocks["scenario"]
+                runner.run("grid_ctf", generations=1, run_id="test_mutation_success")
+
+        mocks["artifacts"].mutation_log.append.assert_called_once()
+        append_args = mocks["artifacts"].mutation_log.append.call_args
+        assert append_args[0][0] == "grid_ctf"
+        entry = append_args[0][1]
+        assert entry.mutation_type == "run_outcome"
+        assert entry.generation == 1
+        assert entry.run_id == "test_mutation_success"
+        assert entry.payload == {
+            "gate_decision": "advance",
+            "best_score": 0.42,
+            "elo": 1042.0,
+        }
+
+        mocks["artifacts"].mutation_log.create_checkpoint.assert_called_once_with(
+            "grid_ctf",
+            generation=1,
+            run_id="test_mutation_success",
+        )
+
+    def test_run_logs_failed_generation_outcome(self, tmp_path: Path) -> None:
+        settings = _make_settings(tmp_path, session_reports_enabled=False)
+        runner, mocks = _make_runner_with_mocks(settings)
+        mocks["artifacts"].mutation_log = MagicMock()
+        mocks["artifacts"].tools_dir.return_value = MagicMock(exists=MagicMock(return_value=True))
+
+        with patch("autocontext.loop.generation_pipeline.GenerationPipeline") as mock_pipeline_cls:
+            mock_pipeline = MagicMock()
+            mock_pipeline_cls.return_value = mock_pipeline
+            mock_pipeline.run_generation.side_effect = RuntimeError("boom")
+
+            with patch.object(runner, "_scenario") as mock_scenario:
+                mock_scenario.return_value = mocks["scenario"]
+                with pytest.raises(RuntimeError, match="boom"):
+                    runner.run("grid_ctf", generations=1, run_id="test_mutation_failure")
+
+        mocks["artifacts"].mutation_log.append.assert_called_once()
+        append_args = mocks["artifacts"].mutation_log.append.call_args
+        assert append_args[0][0] == "grid_ctf"
+        entry = append_args[0][1]
+        assert entry.mutation_type == "run_outcome"
+        assert entry.generation == 1
+        assert entry.run_id == "test_mutation_failure"
+        assert entry.payload == {"status": "failed", "error": "boom"}
+        mocks["artifacts"].mutation_log.create_checkpoint.assert_not_called()
 
 
 class TestSessionReportDeadEnds:
@@ -318,3 +468,32 @@ class TestSessionReportPlacement:
 
         assert mark_idx < report_idx, "Report should be written after mark_run_completed"
         assert report_idx < event_idx, "Report should be written before run_completed event"
+
+
+class TestSessionReportLessonHealth:
+    """Structured lesson health is included when lessons exist."""
+
+    def test_report_includes_structured_lesson_health(self, tmp_path: Path) -> None:
+        settings = _make_settings(tmp_path, session_reports_enabled=True)
+        runner, mocks = _make_runner_with_mocks(settings)
+
+        mocks["sqlite"].get_generation_trajectory.return_value = [
+            {"generation_index": 12, "best_score": 0.7, "elo": 1100, "delta": 0.1, "gate_decision": "advance"},
+        ]
+        mocks["artifacts"].read_dead_ends.return_value = ""
+        mocks["artifacts"].tools_dir.return_value = MagicMock(exists=MagicMock(return_value=True))
+
+        stale_lesson = MagicMock()
+        stale_lesson.is_superseded.return_value = False
+        superseded_lesson = MagicMock()
+        superseded_lesson.is_superseded.return_value = True
+
+        mocks["artifacts"].lesson_store.read_lessons.return_value = [stale_lesson, superseded_lesson]
+        mocks["artifacts"].lesson_store.get_stale_lessons.return_value = [stale_lesson]
+
+        _run_with_pipeline_mock(runner, mocks, "grid_ctf", 1, "test_lesson_health")
+
+        markdown = mocks["artifacts"].write_session_report.call_args[0][2]
+        assert "Lesson Health" in markdown
+        assert "Stale lessons: 1" in markdown
+        assert "Superseded lessons: 1" in markdown

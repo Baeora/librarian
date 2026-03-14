@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-AutoContext is an iterative strategy generation and evaluation system. It runs a multi-agent loop where LLM agents collaboratively evolve strategies for pluggable scenarios, scoring them through tournament matches (game scenarios) or LLM judge evaluation (agent task scenarios) with Elo-based progression gating.
+autocontext is an iterative strategy generation and evaluation system. It runs a multi-agent loop where LLM agents collaboratively evolve strategies for pluggable scenarios, scoring them through tournament matches (game scenarios) or LLM judge evaluation (agent task scenarios) with Elo-based progression gating.
 
 ## Repository Layout
 
@@ -36,7 +36,7 @@ autocontext/                  # Python package root (pyproject.toml lives here)
     _library/               # Global book library (ingested via add-book)
   skills/                     # Runtime-generated: operational skill notes per scenario
   runs/                       # Runtime-generated: SQLite DB, event stream, generation artifacts
-ts/                           # TypeScript port of AutoContext modules
+ts/                           # TypeScript port of autocontext modules
   src/                        # Source code (types, judge, storage, execution, runtimes, scenarios, knowledge, mcp, cli)
   tests/                      # Vitest tests (119 tests)
   migrations/                 # Shared SQLite migration SQL (cross-compatible with Python)
@@ -201,7 +201,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs: ruff check, mypy, pytest, dete
 
 ## TypeScript Port (`ts/`)
 
-A TypeScript port of AutoContext modules under `ts/`, published as `@greyhaven/autoctx`. ESM-only, strict TypeScript, Node.js >=18.
+A TypeScript port of autocontext modules under `ts/`, published as `autoctx`. ESM-only, strict TypeScript, Node.js >=18.
 
 ```bash
 cd ts

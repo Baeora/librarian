@@ -1,6 +1,6 @@
-# AutoContext
+# autocontext
 
-AutoContext is a control plane for improving agent behavior over repeated runs. It combines multi-agent candidate generation, staged validation, scenario execution, knowledge accumulation, optional local distillation, and OpenClaw-facing APIs.
+autocontext is a control plane for improving agent behavior over repeated runs. It combines multi-agent candidate generation, staged validation, scenario execution, knowledge accumulation, optional local distillation, and OpenClaw-facing APIs.
 
 ## Working Directory
 
@@ -155,7 +155,7 @@ uv run --directory autocontext python scripts/generate_protocol.py
 
 ## OpenClaw / ClawHub
 
-AutoContext exposes:
+autocontext exposes:
 
 - artifact contracts for harnesses, policies, and distilled models
 - REST and MCP operations for evaluate, validate, publish, import, and discover
@@ -164,6 +164,7 @@ AutoContext exposes:
 
 ## Additional Docs
 
+- [Agent integration guide](docs/agent-integration.md) — CLI-first integration for external agents, MCP fallback, JSON output reference
 - [Sandbox modes](docs/sandbox.md)
 - [MLX host training](docs/mlx-training.md)
 - [Demo data notes](demo_data/README.md)

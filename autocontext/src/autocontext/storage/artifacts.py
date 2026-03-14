@@ -9,6 +9,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from autocontext.harness.storage.versioned_store import VersionedFileStore
+from autocontext.knowledge.lessons import LessonStore
+from autocontext.knowledge.mutation_log import MutationEntry, MutationLog
 from autocontext.storage.buffered_writer import BufferedWriter
 
 LOGGER = logging.getLogger(__name__)
@@ -37,6 +39,23 @@ class ArtifactStore:
             self._writer = BufferedWriter()
             self._writer.start()
 
+    @property
+    def mutation_log(self) -> MutationLog:
+        """Lazily create a MutationLog for append-only context audit (AC-235)."""
+        if not hasattr(self, "_mutation_log"):
+            self._mutation_log = MutationLog(knowledge_root=self.knowledge_root)
+        return self._mutation_log
+
+    @property
+    def lesson_store(self) -> LessonStore:
+        """Lazily create a LessonStore for structured lesson management (AC-236)."""
+        if not hasattr(self, "_lesson_store"):
+            self._lesson_store = LessonStore(
+                knowledge_root=self.knowledge_root,
+                skills_root=self.skills_root,
+            )
+        return self._lesson_store
+
     def _playbook_store(self, scenario_name: str) -> VersionedFileStore:
         """Lazily create a per-scenario VersionedFileStore with legacy naming."""
         if scenario_name not in self._playbook_stores:
@@ -51,6 +70,27 @@ class ArtifactStore:
 
     def generation_dir(self, run_id: str, generation_index: int) -> Path:
         return self.runs_root / run_id / "generations" / f"gen_{generation_index}"
+
+    def _append_mutation(
+        self,
+        scenario_name: str,
+        *,
+        mutation_type: str,
+        payload: dict[str, object],
+        generation: int = 0,
+        run_id: str = "",
+        description: str = "",
+    ) -> None:
+        self.mutation_log.append(
+            scenario_name,
+            MutationEntry(
+                mutation_type=mutation_type,
+                generation=generation,
+                payload=payload,
+                run_id=run_id,
+                description=description,
+            ),
+        )
 
     def write_json(self, path: Path, payload: dict[str, object]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,6 +156,12 @@ class ArtifactStore:
         # but the scenario directory itself may not exist yet).
         (self.knowledge_root / scenario_name).mkdir(parents=True, exist_ok=True)
         self._playbook_store(scenario_name).write("playbook.md", content.strip() + "\n")
+        self._append_mutation(
+            scenario_name,
+            mutation_type="playbook_updated",
+            payload={"content_length": len(content.strip())},
+            description="Playbook updated",
+        )
 
     def append_coach_history(self, scenario_name: str, generation_index: int, raw_content: str) -> None:
         """Append raw coach output to history file for audit trail."""
@@ -127,13 +173,24 @@ class ArtifactStore:
         return self.skills_root / f"{scenario_name.replace('_', '-')}-ops"
 
     def read_skills(self, scenario_name: str) -> str:
-        """Read operational lessons for injection into AutoContext agent prompts.
+        """Read operational lessons for injection into autocontext agent prompts.
 
         Extracts only the ``## Operational Lessons`` section from SKILL.md.
         The playbook is already injected separately via ``current_playbook``
         in the prompt bundle, so we avoid duplication here.  Claude Code
         reads the full SKILL.md (with bundled resources) on its own.
         """
+        structured_lessons = self.lesson_store.read_lessons(scenario_name)
+        if structured_lessons:
+            current_generation = self.lesson_store.current_generation(scenario_name)
+            applicable = self.lesson_store.get_applicable_lessons(
+                scenario_name,
+                current_generation=current_generation,
+            )
+            if applicable:
+                return "\n".join(lesson.text.strip() for lesson in applicable).strip()
+            return ""
+
         skill_path = self._skill_dir(scenario_name) / "SKILL.md"
         if not skill_path.exists():
             return ""
@@ -194,6 +251,10 @@ class ArtifactStore:
         """Write progress snapshot JSON."""
         path = self.knowledge_root / scenario_name / "progress.json"
         self.write_json(path, snapshot_dict)
+
+    def read_mutation_replay(self, scenario_name: str, *, max_entries: int = 10) -> str:
+        """Read a compact replay summary of mutations since the last checkpoint."""
+        return self.mutation_log.replay_summary(scenario_name, max_entries=max_entries)
 
     def read_progress(self, scenario_name: str) -> dict[str, object] | None:
         """Read progress snapshot, or None if missing."""
@@ -472,7 +533,7 @@ class ArtifactStore:
         skill_content = (
             f"---\nname: {kebab}-ops\ndescription: {desc}\n---\n\n"
             f"# {title} Operational Knowledge\n\n"
-            "Accumulated knowledge from AutoContext strategy evolution.\n\n"
+            "Accumulated knowledge from autocontext strategy evolution.\n\n"
             "## Operational Lessons\n\n"
             "Prescriptive rules derived from what worked and what failed:\n\n"
             f"{lessons_block}\n\n"
@@ -656,6 +717,108 @@ class ArtifactStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
+    # --- Normalized progress reports (AC-190) ---------------------------------
+
+    def _progress_report_dir(self, scenario_name: str) -> Path:
+        return self.knowledge_root / scenario_name / "progress_reports"
+
+    def write_progress_report(self, scenario_name: str, run_id: str, report: object) -> None:
+        """Persist a RunProgressReport as JSON."""
+        pr_dir = self._progress_report_dir(scenario_name)
+        pr_dir.mkdir(parents=True, exist_ok=True)
+        path = pr_dir / f"{run_id}.json"
+        self.write_json(path, report.to_dict())  # type: ignore[attr-defined]
+
+    def read_progress_report(self, scenario_name: str, run_id: str) -> object | None:
+        """Read a RunProgressReport, or None if missing."""
+        from autocontext.knowledge.normalized_metrics import RunProgressReport
+
+        path = self._progress_report_dir(scenario_name) / f"{run_id}.json"
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return RunProgressReport.from_dict(data)
+
+    def read_latest_progress_reports(
+        self, scenario_name: str, max_reports: int = 2,
+    ) -> list[object]:
+        """Read most recent progress reports for a scenario."""
+        from autocontext.knowledge.normalized_metrics import RunProgressReport
+
+        pr_dir = self._progress_report_dir(scenario_name)
+        if not pr_dir.exists():
+            return []
+        files = sorted(pr_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        reports: list[object] = []
+        for path in files[:max_reports]:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            reports.append(RunProgressReport.from_dict(data))
+        return reports
+
+    def read_latest_progress_reports_markdown(self, scenario_name: str, max_reports: int = 2) -> str:
+        """Read recent progress reports and concatenate them as markdown."""
+        from autocontext.knowledge.normalized_metrics import RunProgressReport
+
+        reports = self.read_latest_progress_reports(scenario_name, max_reports=max_reports)
+        if not reports:
+            return ""
+        parts: list[str] = []
+        for report in reports:
+            if isinstance(report, RunProgressReport):
+                parts.append(report.to_markdown())
+        return "\n\n".join(parts)
+
+    # --- Weakness reports (AC-196) -------------------------------------------
+
+    def _weakness_dir(self, scenario_name: str) -> Path:
+        return self.knowledge_root / scenario_name / "weakness_reports"
+
+    def write_weakness_report(self, scenario_name: str, run_id: str, report: object) -> None:
+        """Persist a WeaknessReport as JSON."""
+        wr_dir = self._weakness_dir(scenario_name)
+        wr_dir.mkdir(parents=True, exist_ok=True)
+        path = wr_dir / f"{run_id}.json"
+        self.write_json(path, report.to_dict())  # type: ignore[attr-defined]
+
+    def read_weakness_report(self, scenario_name: str, run_id: str) -> object | None:
+        """Read a WeaknessReport, or None if missing."""
+        from autocontext.knowledge.weakness import WeaknessReport
+
+        path = self._weakness_dir(scenario_name) / f"{run_id}.json"
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return WeaknessReport.from_dict(data)
+
+    def read_latest_weakness_reports(
+        self, scenario_name: str, max_reports: int = 2,
+    ) -> list[object]:
+        """Read most recent weakness reports for a scenario."""
+        from autocontext.knowledge.weakness import WeaknessReport
+
+        wr_dir = self._weakness_dir(scenario_name)
+        if not wr_dir.exists():
+            return []
+        files = sorted(wr_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        reports: list[object] = []
+        for path in files[:max_reports]:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            reports.append(WeaknessReport.from_dict(data))
+        return reports
+
+    def read_latest_weakness_reports_markdown(self, scenario_name: str, max_reports: int = 2) -> str:
+        """Read recent weakness reports and concatenate them as markdown."""
+        from autocontext.knowledge.weakness import WeaknessReport
+
+        reports = self.read_latest_weakness_reports(scenario_name, max_reports=max_reports)
+        if not reports:
+            return ""
+        markdown_parts: list[str] = []
+        for report in reports:
+            if isinstance(report, WeaknessReport):
+                markdown_parts.append(report.to_markdown())
+        return "\n\n".join(markdown_parts)
+
     def read_latest_session_reports(self, scenario_name: str, max_reports: int = 2) -> str:
         """Read the most recent session reports, concatenated."""
         reports_dir = self.knowledge_root / scenario_name / "reports"
@@ -756,6 +919,14 @@ class ArtifactStore:
         path = self.runs_root / "sessions" / session_id / "notebook.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(notebook, indent=2), encoding="utf-8")
+        scenario_name = str(notebook.get("scenario_name", "")).strip()
+        if scenario_name:
+            self._append_mutation(
+                scenario_name,
+                mutation_type="notebook_updated",
+                payload={"session_id": session_id},
+                description=f"Notebook updated for session {session_id}",
+            )
 
     def delete_notebook(self, session_id: str) -> None:
         """Delete the file-backed notebook artifact if it exists."""

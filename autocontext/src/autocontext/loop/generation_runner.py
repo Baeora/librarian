@@ -13,8 +13,11 @@ from autocontext.execution import ExecutionSupervisor
 from autocontext.execution.executors import LocalExecutor, PrimeIntellectExecutor
 from autocontext.harness.meta_optimizer import MetaOptimizer
 from autocontext.integrations.primeintellect import PrimeIntellectClient
+from autocontext.knowledge.mutation_log import MutationEntry
+from autocontext.knowledge.normalized_metrics import generate_run_progress_report
 from autocontext.knowledge.report import generate_session_report
 from autocontext.knowledge.trajectory import ScoreTrajectoryBuilder
+from autocontext.knowledge.weakness import WeaknessAnalyzer
 from autocontext.loop.controller import LoopController
 from autocontext.loop.events import EventStreamEmitter
 from autocontext.scenarios import SCENARIO_REGISTRY
@@ -169,6 +172,23 @@ class GenerationRunner:
         """Generate and persist a session report for a completed run."""
         trajectory_rows = self.sqlite.get_generation_trajectory(run_id)
         dead_ends_count = self._count_dead_ends(scenario_name)
+        current_generation = max(
+            (int(row.get("generation_index", 0)) for row in trajectory_rows),
+            default=0,
+        )
+        structured_lessons = self.artifacts.lesson_store.read_lessons(scenario_name)
+        stale_lessons_count = 0
+        superseded_lessons_count = 0
+        if structured_lessons:
+            stale_lessons_count = len(
+                self.artifacts.lesson_store.get_stale_lessons(
+                    scenario_name,
+                    current_generation=current_generation,
+                )
+            )
+            superseded_lessons_count = sum(
+                1 for lesson in structured_lessons if lesson.is_superseded()
+            )
         report = generate_session_report(
             run_id=run_id,
             scenario=scenario_name,
@@ -176,9 +196,38 @@ class GenerationRunner:
             exploration_mode=self.settings.exploration_mode,
             duration_seconds=duration_seconds,
             dead_ends_found=dead_ends_count,
+            stale_lessons_count=stale_lessons_count,
+            superseded_lessons_count=superseded_lessons_count,
         )
         markdown = report.to_markdown()
         self.artifacts.write_session_report(scenario_name, run_id, markdown)
+
+    def _generate_weakness_report(self, run_id: str, scenario_name: str) -> None:
+        """Generate and persist a weakness report for a completed run."""
+        trajectory_rows = self.sqlite.get_generation_trajectory(run_id)
+        match_rows = self.sqlite.get_matches_for_run(run_id)
+        analyzer = WeaknessAnalyzer()
+        report = analyzer.analyze(
+            run_id=run_id,
+            scenario=scenario_name,
+            trajectory=trajectory_rows,
+            match_data=match_rows,
+        )
+        self.artifacts.write_weakness_report(scenario_name, run_id, report)
+
+    def _generate_progress_report(self, run_id: str, scenario_name: str) -> None:
+        """Generate and persist a normalized progress report for a completed run."""
+        trajectory_rows = self.sqlite.get_generation_trajectory(run_id)
+        role_metrics = self.sqlite.get_agent_role_metrics(run_id)
+        consultation_cost = self.sqlite.get_total_consultation_cost(run_id)
+        report = generate_run_progress_report(
+            run_id=run_id,
+            scenario=scenario_name,
+            trajectory=trajectory_rows,
+            role_metrics=role_metrics,
+            consultation_cost=consultation_cost,
+        )
+        self.artifacts.write_progress_report(scenario_name, run_id, report)
 
     def run(self, scenario_name: str, generations: int, run_id: str | None = None) -> RunSummary:
         scenario = self._scenario(scenario_name)
@@ -304,12 +353,36 @@ class GenerationRunner:
                         replay_narrative=replay_narrative,
                     )
                     ctx = pipeline.run_generation(ctx)
+                    self.artifacts.mutation_log.append(
+                        scenario_name,
+                        MutationEntry(
+                            mutation_type="run_outcome",
+                            generation=generation,
+                            payload={
+                                "gate_decision": ctx.gate_decision,
+                                "best_score": ctx.previous_best,
+                                "elo": ctx.challenger_elo,
+                            },
+                            run_id=active_run_id,
+                            description=f"Generation {generation} completed with {ctx.gate_decision or 'unknown'}",
+                        ),
+                    )
                     previous_best = ctx.previous_best
                     challenger_elo = ctx.challenger_elo
                     replay_narrative = ctx.replay_narrative
                     coach_competitor_hints = ctx.coach_competitor_hints
                     completed += 1
                 except Exception as exc:
+                    self.artifacts.mutation_log.append(
+                        scenario_name,
+                        MutationEntry(
+                            mutation_type="run_outcome",
+                            generation=generation,
+                            payload={"status": "failed", "error": str(exc)},
+                            run_id=active_run_id,
+                            description=f"Generation {generation} failed",
+                        ),
+                    )
                     self.sqlite.upsert_generation(
                         active_run_id,
                         generation,
@@ -327,6 +400,12 @@ class GenerationRunner:
                     )
                     raise
             self.sqlite.mark_run_completed(active_run_id)
+            if completed > 0:
+                self.artifacts.mutation_log.create_checkpoint(
+                    scenario_name,
+                    generation=completed,
+                    run_id=active_run_id,
+                )
             self.artifacts.flush_writes()
         finally:
             self.artifacts.shutdown_writer()
@@ -338,6 +417,14 @@ class GenerationRunner:
                 self._generate_session_report(active_run_id, scenario_name, duration)
             except Exception:
                 LOGGER.warning("failed to generate session report for run %s", active_run_id, exc_info=True)
+        try:
+            self._generate_weakness_report(active_run_id, scenario_name)
+        except Exception:
+            LOGGER.warning("failed to generate weakness report for run %s", active_run_id, exc_info=True)
+        try:
+            self._generate_progress_report(active_run_id, scenario_name)
+        except Exception:
+            LOGGER.warning("failed to generate progress report for run %s", active_run_id, exc_info=True)
 
         # Snapshot knowledge for cross-run inheritance
         if self.settings.cross_run_inheritance and not self.settings.ablation_no_feedback:

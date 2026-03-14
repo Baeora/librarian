@@ -1,5 +1,5 @@
 /**
- * MCP server for AutoContext — agent task evaluation tools.
+ * MCP server for autocontext — agent task evaluation tools.
  * Port of autocontext/src/autocontext/mcp/tools.py (agent task subset).
  */
 
@@ -22,7 +22,7 @@ export interface MtsServerOpts {
 }
 
 export function createMcpServer(opts: MtsServerOpts): McpServer {
-  const { store, provider, model = "claude-sonnet-4-20250514" } = opts;
+  const { store, provider, model = "" } = opts;
   const server = new McpServer({
     name: "autocontext",
     version: "0.1.0",

@@ -184,6 +184,9 @@ class TestStageKnowledgeSetup:
         artifacts.read_playbook.return_value = "Playbook content"
         artifacts.read_tool_context.return_value = ""
         artifacts.read_skills.return_value = ""
+        artifacts.read_mutation_replay.return_value = ""
+        artifacts.read_latest_weakness_reports_markdown.return_value = ""
+        artifacts.read_latest_progress_reports_markdown.return_value = ""
         artifacts.read_latest_advance_analysis.return_value = ""
         artifacts.read_progress.return_value = None
         trajectory = MagicMock()
@@ -199,6 +202,9 @@ class TestStageKnowledgeSetup:
         artifacts.read_playbook.return_value = ""
         artifacts.read_tool_context.return_value = ""
         artifacts.read_skills.return_value = ""
+        artifacts.read_mutation_replay.return_value = ""
+        artifacts.read_latest_weakness_reports_markdown.return_value = ""
+        artifacts.read_latest_progress_reports_markdown.return_value = ""
         artifacts.read_latest_advance_analysis.return_value = ""
         artifacts.read_progress.return_value = None
         trajectory = MagicMock()
@@ -217,6 +223,79 @@ class TestStageKnowledgeSetup:
         assert result.prompts is not None
         artifacts.read_playbook.assert_not_called()
         artifacts.read_tool_context.assert_not_called()
+
+    def test_includes_mutation_replay_in_prompt_context(self) -> None:
+        artifacts = MagicMock()
+        artifacts.read_playbook.return_value = ""
+        artifacts.read_tool_context.return_value = ""
+        artifacts.read_skills.return_value = ""
+        artifacts.read_mutation_replay.return_value = "Context mutations since last checkpoint:\n- gen 2: playbook_updated"
+        artifacts.read_latest_weakness_reports_markdown.return_value = ""
+        artifacts.read_latest_progress_reports_markdown.return_value = ""
+        artifacts.read_latest_advance_analysis.return_value = ""
+        artifacts.read_progress.return_value = None
+        trajectory = MagicMock()
+        trajectory.build_trajectory.return_value = ""
+        trajectory.build_strategy_registry.return_value = ""
+        trajectory.build_experiment_log.return_value = ""
+        ctx = _make_ctx()
+
+        result = stage_knowledge_setup(ctx, artifacts=artifacts, trajectory_builder=trajectory)
+
+        assert result.prompts is not None
+        assert "Context mutations since last checkpoint" in result.prompts.competitor
+
+    def test_includes_recent_weakness_reports_in_prompt_context(self) -> None:
+        artifacts = MagicMock()
+        artifacts.read_playbook.return_value = ""
+        artifacts.read_tool_context.return_value = ""
+        artifacts.read_skills.return_value = ""
+        artifacts.read_mutation_replay.return_value = ""
+        artifacts.read_latest_weakness_reports_markdown.return_value = (
+            "# Weakness Report: run_1\n"
+            "## [HIGH] dead_end_pattern\n"
+            "Repeated rollbacks detected"
+        )
+        artifacts.read_latest_progress_reports_markdown.return_value = ""
+        artifacts.read_latest_advance_analysis.return_value = ""
+        artifacts.read_progress.return_value = None
+        trajectory = MagicMock()
+        trajectory.build_trajectory.return_value = ""
+        trajectory.build_strategy_registry.return_value = ""
+        trajectory.build_experiment_log.return_value = ""
+        ctx = _make_ctx()
+
+        result = stage_knowledge_setup(ctx, artifacts=artifacts, trajectory_builder=trajectory)
+
+        assert result.prompts is not None
+        assert "Recent weakness reports:" in result.prompts.competitor
+        assert "dead_end_pattern" in result.prompts.competitor
+
+    def test_includes_recent_progress_reports_in_prompt_context(self) -> None:
+        artifacts = MagicMock()
+        artifacts.read_playbook.return_value = ""
+        artifacts.read_tool_context.return_value = ""
+        artifacts.read_skills.return_value = ""
+        artifacts.read_mutation_replay.return_value = ""
+        artifacts.read_latest_weakness_reports_markdown.return_value = ""
+        artifacts.read_latest_progress_reports_markdown.return_value = (
+            "# Progress Report: run_2\n"
+            "- Total cost: $0.0240\n"
+            "- Tokens per advance: 3,400"
+        )
+        artifacts.read_latest_advance_analysis.return_value = ""
+        artifacts.read_progress.return_value = None
+        trajectory = MagicMock()
+        trajectory.build_trajectory.return_value = ""
+        trajectory.build_strategy_registry.return_value = ""
+        trajectory.build_experiment_log.return_value = ""
+        ctx = _make_ctx()
+
+        result = stage_knowledge_setup(ctx, artifacts=artifacts, trajectory_builder=trajectory)
+
+        assert result.prompts is not None
+        assert "Recent progress reports:" in result.prompts.competitor
+        assert "Tokens per advance" in result.prompts.competitor
 
 
 # ---------- TestStageAgentGeneration ----------

@@ -1,5 +1,5 @@
 /**
- * autoctx — AutoContext TypeScript toolkit.
+ * autoctx — autocontext TypeScript toolkit.
  */
 
 // Core types
@@ -29,6 +29,20 @@ export {
   NotificationEventSchema,
   ProviderError,
 } from "./types/index.js";
+
+// Providers
+export {
+  createAnthropicProvider,
+  createOpenAICompatibleProvider,
+  createProvider,
+  resolveProviderConfig,
+} from "./providers/index.js";
+export type {
+  AnthropicProviderOpts,
+  OpenAICompatibleProviderOpts,
+  CreateProviderOpts,
+  ProviderConfig,
+} from "./providers/index.js";
 
 // Judge
 export { LLMJudge, parseJudgeResponse } from "./judge/index.js";
